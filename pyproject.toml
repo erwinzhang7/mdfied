@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdfied"
+version = "0.1.0"
+description = "Turn PDFs and videos into clean, chunked Markdown."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "pymupdf",
+    "faster-whisper",
+    "tqdm",
+]
+
+[project.scripts]
+mdfied = "mdfied.cli:main"
+
+[tool.setuptools]
+packages = ["mdfied"]
