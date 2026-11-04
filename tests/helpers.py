@@ -30,7 +30,16 @@ def slide_xml(shapes, show=True):
     )
 
 
-def make_pptx(path, slides, order=None, absolute_targets=False, extra=None):
+def pic(rid, descr=None):
+    d = f' descr="{descr}"' if descr else ""
+    return (
+        f'<p:pic><p:nvPicPr><p:cNvPr id="2" name="p"{d}/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+        f'<p:blipFill><a:blip r:embed="{rid}"/></p:blipFill><p:spPr/></p:pic>'
+    )
+
+
+def make_pptx(path, slides, order=None, absolute_targets=False, extra=None,
+              slide_rels=None):
     """Write a minimal .pptx. ``slides`` is a list of slide XML strings, stored
     as slide1.xml.. in list order; ``order`` lists the indices in presentation
     order (default: list order)."""
@@ -59,6 +68,14 @@ def make_pptx(path, slides, order=None, absolute_targets=False, extra=None):
                    f'<Relationships xmlns="{RELS}">{rels}</Relationships>')
         for i, xml in enumerate(slides):
             z.writestr(f"ppt/slides/slide{i + 1}.xml", xml)
+            rels = (slide_rels or {}).get(i)
+            if rels:
+                body = "".join(
+                    f'<Relationship Id="{rid}" Type="{RT}/image" Target="{t}"/>'
+                    for rid, t in rels
+                )
+                z.writestr(f"ppt/slides/_rels/slide{i + 1}.xml.rels",
+                           f'<Relationships xmlns="{RELS}">{body}</Relationships>')
         for name, data in (extra or {}).items():
             z.writestr(name, data)
 
@@ -73,5 +90,41 @@ def make_pdf(path, text="Hello"):
     doc = fitz.open()
     page = doc.new_page()
     page.insert_text((72, 72), text, fontsize=20)
+    doc.save(str(path))
+    doc.close()
+
+
+def png_bytes(w=64, h=64, rgb=(200, 30, 30)):
+    """A real PNG of a solid colour, built without third-party libraries."""
+    import struct
+    import zlib
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    row = b"\x00" + bytes(rgb) * w
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(row * h)) + chunk(b"IEND", b""))
+
+
+def make_image_pdf(path):
+    """Page 1: a CMYK image, an RGBA image, a 4x4 dot. Page 2: the CMYK image
+    again through the same object."""
+    from mdfied.pdf import fitz
+
+    doc = fitz.open()
+    p = doc.new_page()
+    p.insert_text((72, 40), "Images", fontsize=20)
+    cmyk = fitz.Pixmap(fitz.csCMYK, fitz.IRect(0, 0, 80, 80), False)
+    cmyk.clear_with(90)
+    x_cmyk = p.insert_image(fitz.Rect(0, 100, 80, 180), pixmap=cmyk)
+    rgba = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 80, 60), True)
+    rgba.clear_with(180)
+    p.insert_image(fitz.Rect(100, 100, 180, 160), pixmap=rgba)
+    dot = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 4, 4), False)
+    dot.clear_with(0)
+    p.insert_image(fitz.Rect(0, 200, 4, 204), pixmap=dot)
+    p2 = doc.new_page()
+    p2.insert_image(fitz.Rect(0, 0, 80, 80), xref=x_cmyk)
     doc.save(str(path))
     doc.close()

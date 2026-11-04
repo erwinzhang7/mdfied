@@ -1,13 +1,14 @@
 """
-pptx.py — Extract per-slide text, tables, notes and image references from
-PowerPoint files into Markdown.
+pptx.py — Extract per-slide text, tables, notes and images from PowerPoint
+files (.pptx, .pptm, .ppsx, .potx) into Markdown.
 
 For each .pptx, the slides are walked in presentation order (the slide-id list in
 presentation.xml, resolved through its relationships, not filename order). The
 slide title is the title/ctrTitle placeholder; decks without placeholders (Google
 Slides exports, generated decks) fall back to the topmost single-line text box.
 Every other text shape becomes body text in reading order, tables become
-Markdown tables, pictures are noted as image references, and speaker notes are
+Markdown tables, pictures are copied to lecture_files/ beside the Markdown in
+their original format (or only noted, with images=False), and speaker notes are
 appended under `### Notes`. One Markdown file is written per deck:
 lecture.pptx -> lecture.md.
 
@@ -16,7 +17,10 @@ as `## Slide N — Title`, mirroring the PDF extractor's `## Page N — Title`.
 
 A .pptx is a zip of XML parts. Parts are parsed with defusedxml (no entity
 expansion, no external entities), each part's decompressed size is capped, and
-nothing is extracted to disk.
+only image parts referenced by a slide are ever copied out: each must have a
+raster image extension, start with that format's signature, and fit under a
+size cap, and it is written under a sanitized name inside the assets folder.
+Macros (vbaProject.bin in .pptm) are never read.
 """
 
 import os
@@ -24,6 +28,8 @@ import posixpath
 import zipfile
 
 from defusedxml import ElementTree as ET
+
+from .assets import AssetWriter, md_image
 
 
 # OOXML namespaces used inside a .pptx package.
@@ -45,6 +51,21 @@ MAX_PART_BYTES = 64 * 1024 * 1024
 SKIP_PLACEHOLDERS = {"sldNum", "dt", "ftr", "hdr", "sldImg"}
 TITLE_PLACEHOLDERS = {"title", "ctrTitle"}
 BODY_PLACEHOLDERS = {"body", "obj"}
+
+# Media copied out of a deck: raster formats a Markdown viewer can show, keyed
+# by extension, with the leading bytes each must start with. EMF/WMF and SVG
+# (which can carry script) are noted but not copied.
+MEDIA_SIGNATURES = {
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".gif": (b"GIF87a", b"GIF89a"),
+    ".bmp": (b"BM",),
+    ".tif": (b"II*\x00", b"MM\x00*"),
+    ".tiff": (b"II*\x00", b"MM\x00*"),
+    ".webp": (b"RIFF",),
+}
+MAX_MEDIA_BYTES = 32 * 1024 * 1024
 
 # Fallback titles longer than this are body text, not a heading.
 MAX_FALLBACK_TITLE = 150
@@ -205,19 +226,62 @@ def _table_markdown(tbl):
     return "\n".join(out)
 
 
+class _Media:
+    """Copies image parts out of one deck, each part at most once."""
+
+    def __init__(self, z, writer):
+        self.z = z
+        self.writer = writer
+        self.links = {}  # part name -> link, or a text note when not copied
+
+    def link(self, part):
+        if part not in self.links:
+            self.links[part] = self._copy(part)
+        return self.links[part]
+
+    def _copy(self, part):
+        ext = posixpath.splitext(part)[1].lower()
+        sigs = MEDIA_SIGNATURES.get(ext)
+        if sigs is None:
+            return "unsupported format"
+        try:
+            info = self.z.getinfo(part)
+        except KeyError:
+            return "missing from the file"
+        if info.file_size > MAX_MEDIA_BYTES:
+            return "too large"
+        with self.z.open(info) as f:
+            data = f.read(MAX_MEDIA_BYTES + 1)
+        if len(data) > MAX_MEDIA_BYTES:
+            return "too large"
+        if not data.startswith(sigs) or (ext == ".webp" and data[8:12] != b"WEBP"):
+            return "content does not match its extension"
+        return self.writer.add(data, posixpath.basename(part))
+
+
 class _Slide:
-    def __init__(self, number, rels):
+    def __init__(self, number, rels, media=None):
         self.number = number
         self.rels = rels
+        self.media = media
         self.title = None
-        self.blocks = []  # (offset or None, is_top_level, lines-as-string, single_line)
+        self.blocks = []  # dicts: offset, fallback_ok, text
         self.images = []
 
-    def image(self, blip):
+    def image(self, blip, descr=None):
         rid = blip.get(_q(R, "embed")) or blip.get(_q(R, "link"))
         rel = self.rels.get(rid)
         name = posixpath.basename(rel[1]) if rel else "image"
-        self.images.append(f"[IMAGE: {name} — image on slide {self.number}]")
+        where = f"image on slide {self.number}"
+        external = blip.get(_q(R, "embed")) is None
+        if self.media is None or rel is None or external:
+            self.images.append(f"[IMAGE: {name} — {where}]")
+            return
+        link = self.media.link(rel[1])
+        if "/" in link:
+            self.images.append(md_image(descr or where, link))
+        else:
+            self.images.append(f"[IMAGE: {name} not copied ({link}) — {where}]")
 
 
 def _walk(slide, container, top_level):
@@ -265,8 +329,10 @@ def _walk(slide, container, top_level):
                     "text": f"[CHART — chart on slide {slide.number}]",
                 })
         elif tag == _q(P, "pic"):
+            c_nv = el.find(f"{_q(P, 'nvPicPr')}/{_q(P, 'cNvPr')}")
+            descr = c_nv.get("descr") if c_nv is not None else None
             for blip in el.iter(_q(A, "blip")):
-                slide.image(blip)
+                slide.image(blip, (descr or "").strip() or None)
 
 
 def _fallback_title(slide):
@@ -300,14 +366,14 @@ def _notes_text(z, rels):
     return ""
 
 
-def extract_slide(z, part, slide_number):
+def extract_slide(z, part, slide_number, media=None):
     """Extract title, body text, tables, images and notes from one slide.
 
     Returns a formatted Markdown string for the slide.
     """
     root = _read_xml(z, part)
     rels = _rels(z, part)
-    slide = _Slide(slide_number, rels)
+    slide = _Slide(slide_number, rels, media)
     sp_tree = root.find(f"{_q(P, 'cSld')}/{_q(P, 'spTree')}")
     if sp_tree is not None:
         _walk(slide, sp_tree, True)
@@ -331,21 +397,17 @@ def extract_slide(z, part, slide_number):
     return "\n".join(lines)
 
 
-def pptx_to_markdown(pptx_path, out_dir, out_path=None):
-    """Extract all slides from ``pptx_path`` into one .md file.
-
-    Writes ``out_dir/<stem>.md``, or ``out_path`` when given. Returns the number
-    of slides extracted.
-    """
+def convert_pptx(pptx_path, out_path, images=True):
+    """Write ``out_path`` (and its image folder). Returns (slides, asset links)."""
     stem = os.path.splitext(os.path.basename(pptx_path))[0]
-    if out_path is None:
-        out_path = os.path.join(out_dir, stem + ".md")
+    writer = AssetWriter(out_path)
 
     with zipfile.ZipFile(pptx_path) as z:
+        media = _Media(z, writer) if images else None
         sections = []
         for i, part in enumerate(_slide_order(z)):
             try:
-                sections.append(extract_slide(z, part, i + 1))
+                sections.append(extract_slide(z, part, i + 1, media))
             except KeyError:
                 # Listed in presentation.xml but missing from the package.
                 sections.append(f"## Slide {i + 1}\n\n*(slide part missing: {part})*")
@@ -355,4 +417,17 @@ def pptx_to_markdown(pptx_path, out_dir, out_path=None):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    return len(sections)
+    return len(sections), writer.written
+
+
+def pptx_to_markdown(pptx_path, out_dir, out_path=None, images=True):
+    """Extract all slides from ``pptx_path`` into one .md file.
+
+    Writes ``out_dir/<stem>.md``, or ``out_path`` when given, with pictures in
+    ``<stem>_files/`` beside it (``images=False`` only notes them). Returns the
+    number of slides extracted.
+    """
+    if out_path is None:
+        stem = os.path.splitext(os.path.basename(pptx_path))[0]
+        out_path = os.path.join(out_dir, stem + ".md")
+    return convert_pptx(pptx_path, out_path, images)[0]

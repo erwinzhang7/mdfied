@@ -61,12 +61,13 @@ def test_python_pptx_deck(tmp_path):
 
     n, md = convert(tmp_path, src)
     assert n == 3
+    assert (tmp_path / "out_files" / "image1.png").read_bytes() == tiny_png()
     assert md == (
         "# deck\n\n"
         "## Slide 1 — Table\n\n"
         "| h1 | h\\|2 |\n|---|---|\n| a | b |\n\n"
         "grouped\n\n"
-        "[IMAGE: image1.png — image on slide 1]\n\n"
+        "![image.png](out_files/image1.png)\n\n"
         "## Slide 2 — Deck Title\n\n"
         "A subtitle\n\n"
         "## Slide 3 — Bullets\n\n"
