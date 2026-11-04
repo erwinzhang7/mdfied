@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from helpers import make_pdf, simple_pptx
+from helpers import make_pdf, make_pptx, simple_pptx, slide_xml, text_box
 
 from mdfied import cli
 from mdfied import video as video_mod
@@ -34,7 +34,7 @@ def outputs(root):
         return []
     return sorted(
         str(p.relative_to(root)).replace(os.sep, "/")
-        for p in root.rglob("*") if p.is_file()
+        for p in root.rglob("*") if p.is_file() and p.name != ".mdfy-manifest.json"
     )
 
 
@@ -303,3 +303,11 @@ def test_intermixed_options_and_paths(tmp_path, monkeypatch):
     tree(tmp_path, "a/x.pdf", "b/y.pdf")
     assert run(tmp_path, monkeypatch, "a", "-o", "out", "b") == 0
     assert outputs(tmp_path / "out") == ["x.md", "y.md"]
+
+
+@pytest.mark.parametrize("ext", [".pptm", ".ppsx", ".potx"])
+def test_pptx_family_extensions_in_cli(tmp_path, monkeypatch, ext):
+    make_pptx(tmp_path / f"deck{ext}", [slide_xml([text_box("Hi", ph="title")])])
+    monkeypatch.chdir(tmp_path)
+    assert cli.main([]) == 0
+    assert (tmp_path / "md" / "deck.md").read_text().startswith("# deck\n\n## Slide 1 — Hi")

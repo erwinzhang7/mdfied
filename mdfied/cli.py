@@ -7,22 +7,27 @@ cli.py — command-line entry point (`mdfy`, also installed as `mdfied`).
     mdfy video [PATH ...] [options]    video/audio only
 
 PATH defaults to the current directory. Directories are walked recursively and
-the output mirrors the source tree under -o (default: ./md). Files whose
-Markdown is already newer than the source are skipped unless --force is given.
+the output mirrors the source tree under -o (default: ./md), with each
+document's images in a <name>_files/ folder beside its Markdown. What was
+written is recorded in <out>/.mdfy-manifest.json: unchanged sources are skipped
+unless --force is given, and only files listed there are ever deleted.
 """
 
 import argparse
 import os
+import posixpath
 import sys
 
 from . import __version__
 from . import video as video_mod
+from .manifest import Manifest
 from .walk import IGNORE_FILE, scan_paths
 
 PROG = "mdfy"
 
 PDF_EXTS = {".pdf"}
-PPTX_EXTS = {".pptx"}
+# .pptm/.ppsx/.potx share the .pptx layout; macros in .pptm are never read.
+PPTX_EXTS = {".pptx", ".pptm", ".ppsx", ".potx"}
 # Containers/audio that ffmpeg (via faster-whisper) can decode.
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v",
@@ -40,26 +45,52 @@ def kind_of(ext):
     return None
 
 
-def up_to_date(src, out):
+def opts_key(kind, args):
+    """What, besides the source, decides an output's content."""
+    if kind == "video":
+        return ""
+    if not args.images:
+        return "noimg"
+    return "img+all" if (kind == "pdf" and args.all_images) else "img"
+
+
+class Plan:
+    def __init__(self):
+        self.todo = []      # (kind, source, out_rel)
+        self.fresh = []
+        self.clashes = []   # (source, out_rel, other source)
+        self.renamed = []   # (stale out_rel, new out_rel)
+        self.prune = []     # (out_rel, reason)
+
+
+def is_fresh(manifest, kind, src, rel, args):
+    if manifest.get(rel) is not None:
+        return manifest.up_to_date(rel, src, opts_key(kind, args))
+    # No record: written by mdfy before 0.3, or by hand. Documents are cheap to
+    # redo; a transcript counts as current when it is newer than the media.
+    if kind != "video":
+        return False
     try:
-        return os.path.getmtime(out) >= os.path.getmtime(src)
+        return os.path.getmtime(manifest.abs(rel)) >= os.path.getmtime(src)
     except OSError:
         return False
 
 
-def plan(args, kinds):
-    """Scan the paths and sort sources into convert / skip lists.
+def make_plan(args, kinds, manifest):
+    """Scan the paths and decide what to convert, skip, rename and prune.
 
     Output names are decided over every supported type, even when a subcommand
     converts only one, so a file's output path doesn't depend on the command.
     """
+    paths = args.paths or ["."]
     scan = scan_paths(
-        args.paths or ["."], ALL_EXTS, args.output,
+        paths, ALL_EXTS, args.output,
         hidden=args.hidden, use_ignore_files=not args.no_ignore,
         patterns=args.ignore,
     )
-    explicit = {os.path.abspath(p) for p in args.paths if os.path.isfile(p)}
-    todo, fresh, clashes = [], [], []
+    plan = Plan()
+    explicit = {os.path.abspath(p) for p in paths if os.path.isfile(p)}
+    taken = {s.out_rel.casefold() for s in scan.sources}
     claimed = {}
     for s in scan.sources:
         kind = kind_of(s.ext)
@@ -68,93 +99,169 @@ def plan(args, kinds):
             if os.path.abspath(s.path) in explicit:
                 scan.unsupported.append(s.path)
             continue
-        out = os.path.join(args.output, *s.out_rel.split("/"))
-        key = os.path.normcase(os.path.abspath(out)).casefold()
+        key = s.out_rel.casefold()
         if key in claimed:
-            clashes.append((s, out, claimed[key]))
+            plan.clashes.append((s.path, s.out_rel, claimed[key]))
             continue
         claimed[key] = s.path
-        item = (kind, s.path, out)
-        if not args.force and up_to_date(s.path, out):
-            fresh.append(item)
+        if not args.force and is_fresh(manifest, kind, s.path, s.out_rel, args):
+            plan.fresh.append((kind, s.path, s.out_rel))
         else:
-            todo.append(item)
+            plan.todo.append((kind, s.path, s.out_rel))
+        # A collision appearing or going away renames the output
+        # (report.md <-> report.pdf.md); the old name is stale.
+        d = posixpath.dirname(s.out_rel)
+        name = posixpath.basename(s.rel)
+        stem = os.path.splitext(name)[0]
+        real = os.path.realpath(s.path)
+        for old_name in {stem + ".md", name + ".md"}:
+            old = posixpath.join(d, old_name) if d else old_name
+            e = manifest.get(old)
+            if old != s.out_rel and old.casefold() not in taken and e \
+                    and e.get("source") == real:
+                plan.renamed.append((old, s.out_rel))
+
+    if args.prune:
+        live = {os.path.realpath(s.path) for s in scan.sources}
+        roots = [os.path.realpath(p) for p in paths if os.path.isdir(p)]
+        for rel, e in sorted(manifest.outputs.items()):
+            src = e.get("source", "")
+            if e.get("kind") not in kinds or rel.casefold() in taken:
+                continue
+            in_scope = src in {os.path.realpath(p) for p in explicit} or any(
+                src == r or src.startswith(r.rstrip(os.sep) + os.sep) for r in roots
+            )
+            if not in_scope:
+                continue
+            if not os.path.exists(src):
+                plan.prune.append((rel, "source deleted"))
+            elif src not in live:
+                plan.prune.append((rel, "source ignored"))
+
     # Report ignored files only for the types this command converts.
     scan.ignored = [
         (path, why) for path, why in scan.ignored
         if path.endswith("/") or kind_of(os.path.splitext(path)[1].lower()) in kinds
     ]
-    return scan, todo, fresh, clashes
+    return scan, plan
 
 
-def convert_one(kind, src, out):
+def convert_doc(kind, src, out, args):
     if kind == "pdf":
-        from .pdf import pdf_to_markdown
-        return pdf_to_markdown(src, None, out_path=out)
-    from .pptx import pptx_to_markdown
-    return pptx_to_markdown(src, None, out_path=out)
+        from .pdf import convert_pdf
+        return convert_pdf(src, out, images=args.images, all_images=args.all_images)
+    from .pptx import convert_pptx
+    return convert_pptx(src, out, images=args.images)
+
+
+def record(manifest, kind, src, rel, st, args, links):
+    d = posixpath.dirname(rel)
+    assets = [posixpath.join(d, link) if d else link for link in links]
+    old = manifest.get(rel)
+    if old:
+        manifest.remove_assets(rel, keep=set(assets))
+    manifest.record(rel, kind, src, st, opts_key(kind, args), assets)
+
+
+def delete_owned(manifest, rel, why):
+    """Remove an output mdfy wrote, unless someone has changed it since."""
+    if manifest.owned_unchanged(rel):
+        manifest.remove(rel)
+        print(f"Removed {manifest.abs(rel)} ({why})")
+    else:
+        if os.path.exists(manifest.abs(rel)):
+            print(f"Left {manifest.abs(rel)} in place ({why}, but it was "
+                  "changed after mdfy wrote it)", file=sys.stderr)
+        manifest.forget(rel)
 
 
 def run(args, kinds):
-    scan, todo, fresh, clashes = plan(args, kinds)
+    manifest = Manifest(args.output)
+    scan, plan = make_plan(args, kinds, manifest)
+    out = manifest.abs
 
     for p in scan.missing:
         print(f"Skipping '{p}': not found", file=sys.stderr)
     for p in scan.unsupported:
         print(f"Skipping '{p}': unsupported extension", file=sys.stderr)
-    for s, out, other in clashes:
-        print(f"Skipping '{s.path}': output '{out}' is already taken by '{other}'",
+    for src, rel, other in plan.clashes:
+        print(f"Skipping '{src}': output '{out(rel)}' is already taken by '{other}'",
               file=sys.stderr)
 
     if args.dry_run:
-        for kind, src, out in todo:
-            print(f"convert  {src} -> {out}")
-        for kind, src, out in fresh:
-            print(f"skip     {src} (up to date: {out})")
+        for _kind, src, rel in plan.todo:
+            print(f"convert  {src} -> {out(rel)}")
+        for _kind, src, rel in plan.fresh:
+            print(f"skip     {src} (up to date: {out(rel)})")
+        for old, new in plan.renamed:
+            print(f"remove   {out(old)} (renamed to {posixpath.basename(new)})")
+        for rel, why in plan.prune:
+            print(f"prune    {out(rel)} ({why})")
         for path, why in scan.ignored:
             print(f"ignore   {path} ({why})")
-        print(f"\n{len(todo)} to convert, {len(fresh)} up to date, "
-              f"{len(scan.ignored)} ignored")
-        return 1 if (scan.missing or clashes) else 0
+        extra = f", {len(plan.prune)} to prune" if args.prune else ""
+        print(f"\n{len(plan.todo)} to convert, {len(plan.fresh)} up to date, "
+              f"{len(scan.ignored)} ignored{extra}")
+        return 1 if (scan.missing or plan.clashes) else 0
 
-    if not todo and not fresh:
+    if not plan.todo and not plan.fresh and not plan.prune:
         print("No supported files found.", file=sys.stderr)
         return 1
 
-    stats = {k: {"done": 0, "units": 0, "fresh": 0, "failed": 0} for k in kinds}
-    for kind, _src, _out in fresh:
+    stats = {k: {"done": 0, "units": 0, "fresh": 0, "failed": 0}
+             for k in KINDS if k in kinds}
+    for kind, _src, _rel in plan.fresh:
         stats[kind]["fresh"] += 1
-    for s, _out, _other in clashes:
-        stats[kind_of(s.ext)]["failed"] += 1
+    for src, _rel, _other in plan.clashes:
+        stats[kind_of(os.path.splitext(src)[1].lower())]["failed"] += 1
+    ok = {rel for _k, _s, rel in plan.fresh}
 
-    docs = [t for t in todo if t[0] != "video"]
-    if docs:
-        from tqdm import tqdm
-        for kind, src, out in tqdm(docs, desc="Extracting", unit="file"):
-            try:
-                n = convert_one(kind, src, out)
-            except Exception as exc:
-                tqdm.write(f"  Warning: failed on '{src}': {exc}")
-                stats[kind]["failed"] += 1
-                continue
-            stats[kind]["done"] += 1
-            stats[kind]["units"] += n
+    try:
+        docs = [t for t in plan.todo if t[0] != "video"]
+        if docs:
+            from tqdm import tqdm
+            for kind, src, rel in tqdm(docs, desc="Extracting", unit="file"):
+                try:
+                    st = os.stat(src)
+                    n, links = convert_doc(kind, src, out(rel), args)
+                except Exception as exc:
+                    tqdm.write(f"  Warning: failed on '{src}': {exc}")
+                    stats[kind]["failed"] += 1
+                    continue
+                record(manifest, kind, src, rel, st, args, links)
+                ok.add(rel)
+                stats[kind]["done"] += 1
+                stats[kind]["units"] += n
 
-    videos = [t for t in todo if t[0] == "video"]
-    if videos:
-        total_chunks, total_files, failed = video_mod.transcribe_all(
-            [src for _k, src, _o in videos],
-            args.output,
-            model_size=args.model,
-            num_workers=args.workers,
-            cpu_threads=args.threads,
-            chunk_size=args.chunk_size,
-            chunk_overlap=args.chunk_overlap,
-            out_paths=[out for _k, _s, out in videos],
-        )
-        stats["video"]["done"] += total_files
-        stats["video"]["units"] += total_chunks
-        stats["video"]["failed"] += len(failed)
+        videos = [t for t in plan.todo if t[0] == "video"]
+        if videos:
+            stat_before = {src: os.stat(src) for _k, src, _r in videos}
+            total_chunks, total_files, failed = video_mod.transcribe_all(
+                [src for _k, src, _r in videos],
+                args.output,
+                model_size=args.model,
+                num_workers=args.workers,
+                cpu_threads=args.threads,
+                chunk_size=args.chunk_size,
+                chunk_overlap=args.chunk_overlap,
+                out_paths=[out(rel) for _k, _s, rel in videos],
+            )
+            bad = {p for p, _exc in failed}
+            for _k, src, rel in videos:
+                if src not in bad:
+                    record(manifest, "video", src, rel, stat_before[src], args, [])
+                    ok.add(rel)
+            stats["video"]["done"] += total_files
+            stats["video"]["units"] += total_chunks
+            stats["video"]["failed"] += len(failed)
+
+        for old, new in plan.renamed:
+            if new in ok:
+                delete_owned(manifest, old, f"renamed to {posixpath.basename(new)}")
+        for rel, why in plan.prune:
+            delete_owned(manifest, rel, why)
+    finally:
+        manifest.save()
 
     print()
     for kind, st in stats.items():
@@ -162,8 +269,8 @@ def run(args, kinds):
             continue
         print(f"{kind:6} {st['done']} converted ({st['units']} {UNITS[kind]}), "
               f"{st['fresh']} up to date, {st['failed']} failed")
-    if fresh:
-        print(f"Skipped {len(fresh)} up-to-date file(s); use --force to redo them.")
+    if plan.fresh:
+        print(f"Skipped {len(plan.fresh)} up-to-date file(s); use --force to redo them.")
     if scan.ignored:
         print(f"Ignored {len(scan.ignored)} path(s).")
     print(f"Output: {os.path.abspath(args.output)}")
@@ -172,7 +279,7 @@ def run(args, kinds):
     return 1 if (failed or scan.missing) else 0
 
 
-def _common(parser, video_opts):
+def _common(parser, video_opts, docs_opts=True):
     parser.add_argument("paths", nargs="*", metavar="PATH",
                         help="files or folders (default: current directory)")
     parser.add_argument("-o", "--output", default="./md",
@@ -187,6 +294,16 @@ def _common(parser, video_opts):
                         help="gitignore-style pattern to skip (repeatable)")
     parser.add_argument("--no-ignore", action="store_true",
                         help=f"don't read {IGNORE_FILE} files")
+    parser.add_argument("--prune", action="store_true",
+                        help="delete outputs mdfy wrote whose sources were deleted or "
+                             "are now ignored")
+    if docs_opts:
+        parser.add_argument("--no-images", dest="images", action="store_false",
+                            help="note images in the text instead of saving them")
+        parser.add_argument("--all-images", action="store_true",
+                            help="keep tiny PDF images (rules, bullets) too")
+    else:
+        parser.set_defaults(images=True, all_images=False)
     parser.add_argument("--version", action="version",
                         version=f"{PROG} {__version__}")
     if video_opts:
@@ -232,7 +349,7 @@ def build_parser(command=None):
         "video": "Transcribe video/audio to Markdown.",
     }
     p = argparse.ArgumentParser(prog=f"{PROG} {command}", description=helps[command])
-    return _common(p, video_opts=command == "video")
+    return _common(p, video_opts=command == "video", docs_opts=command != "video")
 
 
 def main(argv=None):
