@@ -5,4 +5,4 @@ from .pptx import pptx_to_markdown
 from .video import video_to_markdown
 
 __all__ = ["pdf_to_markdown", "pptx_to_markdown", "video_to_markdown"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
