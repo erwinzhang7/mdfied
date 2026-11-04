@@ -4,20 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mdfied"
-version = "0.1.0"
-description = "Turn PDFs and videos into clean, chunked Markdown."
+version = "0.2.0"
+description = "Turn PDFs, PowerPoint decks, and videos into clean, chunked Markdown."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     "pymupdf",
     "defusedxml",
+    "pathspec>=0.12",
     "faster-whisper",
     "tqdm",
 ]
 
+[project.optional-dependencies]
+test = ["pytest", "python-pptx"]
+
 [project.scripts]
+mdfy = "mdfied.cli:main"
 mdfied = "mdfied.cli:main"
 
 [tool.setuptools]
 packages = ["mdfied"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]

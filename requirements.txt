@@ -1,4 +1,5 @@
 pymupdf          # PDF text/image extraction
 defusedxml       # hardened XML parsing for .pptx
+pathspec>=0.12   # gitignore matching for .mdfyignore
 faster-whisper   # fast CPU transcription (CTranslate2, int8)
 tqdm             # progress bars
