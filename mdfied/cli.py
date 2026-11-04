@@ -2,6 +2,7 @@
 cli.py — command-line entry point for mdfied.
 
     mdfied pdf   <path> [path ...] [-o OUT]
+    mdfied pptx  <path> [path ...] [-o OUT]
     mdfied video <path> [path ...] [-o OUT] [--model base] [--workers 4] ...
 
 Each path may be a file or a directory; directories are scanned for matching
@@ -14,8 +15,10 @@ import sys
 
 from . import video as video_mod
 from .pdf import pdf_to_markdown
+from .pptx import pptx_to_markdown
 
 PDF_EXTS = {".pdf"}
+PPTX_EXTS = {".pptx"}
 # Containers/audio that ffmpeg (via faster-whisper) can decode.
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v",
@@ -61,6 +64,26 @@ def cmd_pdf(args):
     return 0
 
 
+def cmd_pptx(args):
+    files = gather_files(args.paths, PPTX_EXTS)
+    if not files:
+        print("No PPTX files found.", file=sys.stderr)
+        return 1
+
+    from tqdm import tqdm
+
+    total_slides = 0
+    for pptx_path in tqdm(files, desc="Extracting PPTX", unit="file"):
+        try:
+            total_slides += pptx_to_markdown(pptx_path, args.output)
+        except Exception as exc:
+            tqdm.write(f"  Warning: failed on '{pptx_path}': {exc}")
+
+    print(f"\nExtracted {total_slides} slides from {len(files)} PPTX file(s)")
+    print(f"Output written to: {os.path.abspath(args.output)}")
+    return 0
+
+
 def cmd_video(args):
     files = gather_files(args.paths, VIDEO_EXTS)
     if not files:
@@ -92,6 +115,11 @@ def build_parser():
     p_pdf.add_argument("paths", nargs="+", help="PDF file(s) or folder(s)")
     p_pdf.add_argument("-o", "--output", default="./md", help="output dir (default: ./md)")
     p_pdf.set_defaults(func=cmd_pdf)
+
+    p_pptx = sub.add_parser("pptx", help="extract PowerPoint(s) to Markdown")
+    p_pptx.add_argument("paths", nargs="+", help="PPTX file(s) or folder(s)")
+    p_pptx.add_argument("-o", "--output", default="./md", help="output dir (default: ./md)")
+    p_pptx.set_defaults(func=cmd_pptx)
 
     p_vid = sub.add_parser("video", help="transcribe video/audio to Markdown")
     p_vid.add_argument("paths", nargs="+", help="media file(s) or folder(s)")

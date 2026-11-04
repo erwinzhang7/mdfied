@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     "pymupdf",
+    "defusedxml",
     "faster-whisper",
     "tqdm",
 ]

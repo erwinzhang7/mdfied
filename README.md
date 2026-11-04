@@ -1,8 +1,9 @@
 # mdfied
 
-Turn PDFs and videos into clean, chunked Markdown.
+Turn PDFs, PowerPoint decks, and videos into clean, chunked Markdown.
 
 - **PDFs** → one `.md` per file, one `## Page N — Title` section per page, with image references.
+- **PPTX** → one `.md` per deck, one `## Slide N — Title` section per slide (in presentation order), with bullets, tables as Markdown tables, image references, and speaker notes. Reads the file directly; no PowerPoint or LibreOffice needed.
 - **Video / audio** → one `.md` per file, transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (int8 CPU), split into overlapping word-based chunks tagged with `## [HH:MM:SS]` timestamps. Multiple files transcribe in parallel.
 
 Works on any file — no naming convention required. Output filenames mirror the source (`report.pdf → report.md`, `talk.mp4 → talk.md`).
@@ -23,12 +24,17 @@ pip install -e .
 mdfied pdf report.pdf
 mdfied pdf ./papers/ -o ./out
 
+# PowerPoint decks
+mdfied pptx "Unit 1 Lecture.pptx"
+mdfied pptx ./slides/ -o ./out
+
 # Video / audio
 mdfied video talk.mp4
 mdfied video ./lectures/ -o ./out --model small --workers 6
 
 # Mixed folder? Each command picks up only its own file types.
 mdfied pdf ./raw/ -o ./md
+mdfied pptx ./raw/ -o ./md
 mdfied video ./raw/ -o ./md
 ```
 
@@ -47,13 +53,15 @@ Output defaults to `./md`.
 ## Library use
 
 ```python
-from mdfied import pdf_to_markdown, video_to_markdown
+from mdfied import pdf_to_markdown, pptx_to_markdown, video_to_markdown
 
 pdf_to_markdown("report.pdf", "out/")
+pptx_to_markdown("lecture.pptx", "out/")
 video_to_markdown("talk.mp4", "out/", model_size="small")
 ```
 
 ## Supported inputs
 
 - **PDF:** `.pdf`
+- **PPTX:** `.pptx`
 - **Media:** `.mp4 .mkv .mov .webm .avi .m4v .mp3 .wav .m4a .flac .ogg .aac` (anything ffmpeg can decode)
