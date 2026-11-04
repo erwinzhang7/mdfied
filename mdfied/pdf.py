@@ -93,13 +93,15 @@ def extract_page(page, page_number):
     return "\n".join(lines)
 
 
-def pdf_to_markdown(pdf_path, out_dir):
-    """Extract all pages from ``pdf_path`` and write one .md file to ``out_dir``.
+def pdf_to_markdown(pdf_path, out_dir, out_path=None):
+    """Extract all pages from ``pdf_path`` into one .md file.
 
-    Returns the number of pages extracted.
+    Writes ``out_dir/<stem>.md``, or ``out_path`` when given. Returns the number
+    of pages extracted.
     """
     stem = os.path.splitext(os.path.basename(pdf_path))[0]
-    out_path = os.path.join(out_dir, stem + ".md")
+    if out_path is None:
+        out_path = os.path.join(out_dir, stem + ".md")
 
     doc = fitz.open(pdf_path)
     sections = []
@@ -111,7 +113,7 @@ def pdf_to_markdown(pdf_path, out_dir):
         doc.close()
 
     content = f"# {stem}\n\n" + "\n\n".join(sections) + "\n"
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(content)
 
