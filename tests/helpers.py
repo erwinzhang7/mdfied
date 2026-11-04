@@ -68,7 +68,7 @@ def simple_pptx(path, title="Deck"):
 
 
 def make_pdf(path, text="Hello"):
-    import fitz
+    from mdfied.pdf import fitz
 
     doc = fitz.open()
     page = doc.new_page()

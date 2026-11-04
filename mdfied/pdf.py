@@ -12,7 +12,10 @@ Works on any PDF — there is no filename convention. Page sections are emitted 
 
 import os
 
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24.3; the old `fitz` name now warns
+except ImportError:
+    import fitz
 
 
 # Font size (pt) above which a text block is treated as a candidate page title.
