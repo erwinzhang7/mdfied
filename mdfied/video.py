@@ -17,7 +17,6 @@ import os
 import threading
 import concurrent.futures
 
-from faster_whisper import WhisperModel
 from tqdm import tqdm
 
 DEFAULT_MODEL = "base"
@@ -35,6 +34,10 @@ _local = threading.local()
 def _get_model(model_size, cpu_threads):
     key = (model_size, cpu_threads)
     if getattr(_local, "key", None) != key:
+        # Imported here so the CLI, PDF and PPTX paths don't pay for loading
+        # CTranslate2 (or need it installed).
+        from faster_whisper import WhisperModel
+
         _local.model = WhisperModel(
             model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads
         )
